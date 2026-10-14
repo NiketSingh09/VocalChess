@@ -1,0 +1,260 @@
+import sys
+import threading
+import time
+import tkinter as tk
+from tkinter import messagebox
+import chess
+import speech_recognition as sr
+import sounddevice as sd
+import numpy as np
+from PIL import Image, ImageTk
+import urllib.request
+import os
+
+class HandsFreeVoiceChess:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Hands-Free Voice Chess Studio")
+        self.root.geometry("820x600")
+        self.root.configure(bg="#312e2b")
+        self.root.resizable(False, False)
+
+        self.board = chess.Board()
+        self.recognizer = sr.Recognizer()
+        
+        self.is_running = True
+        self.sample_rate = 16000
+        self.offset_x = 30
+        self.offset_y = 30
+        self.square_size = 60
+        self.piece_images = {}
+
+        self.download_assets()
+        self.load_images()
+        self.setup_ui()
+        self.update_board_display()
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        # Start listening loop using sounddevice (NO PYAUDIO NEEDED)
+        self.listening_thread = threading.Thread(target=self.continuous_sounddevice_loop, daemon=True)
+        self.listening_thread.start()
+
+    def download_assets(self):
+        os.makedirs("assets", exist_ok=True)
+        pieces = ['wP', 'wR', 'wN', 'wB', 'wQ', 'wK', 'bP', 'bR', 'bN', 'bB', 'bQ', 'bK']
+        base_url = "https://images.chesscomfiles.com/chess-themes/pieces/neo/150/"
+
+        for piece in pieces:
+            filepath = os.path.join("assets", f"{piece}.png")
+            if not os.path.exists(filepath):
+                try:
+                    urllib.request.urlretrieve(f"{base_url}{piece.lower()}.png", filepath)
+                except Exception as e:
+                    print(f"Error downloading asset {piece}: {e}")
+
+    def load_images(self):
+        pieces = {'P': 'wP', 'R': 'wR', 'N': 'wN', 'B': 'wB', 'Q': 'wQ', 'K': 'wK',
+                  'p': 'bP', 'r': 'bR', 'n': 'bN', 'b': 'bB', 'q': 'bQ', 'k': 'bK'}
+        for symbol, filename in pieces.items():
+            filepath = f"assets/{filename}.png"
+            if os.path.exists(filepath):
+                img = Image.open(filepath).resize((60, 60), Image.Resampling.LANCZOS)
+                self.piece_images[symbol] = ImageTk.PhotoImage(img)
+
+    def setup_ui(self):
+        self.canvas = tk.Canvas(self.root, width=540, height=540, bg="#262421", highlightthickness=0)
+        self.canvas.place(x=20, y=20)
+
+        self.panel = tk.Frame(self.root, bg="#262421", width=220, height=540)
+        self.panel.place(x=580, y=20)
+
+        tk.Label(self.panel, text="Voice Chess", font=("Arial", 18, "bold"), fg="white", bg="#262421").pack(pady=15)
+        
+        self.turn_label = tk.Label(self.panel, text="Turn: White", font=("Arial", 14, "bold"), fg="#ffd700", bg="#262421")
+        self.turn_label.pack(pady=5)
+
+        self.status_box = tk.Label(self.panel, text="🟢 Listening...\nSpeak move anytime!", 
+                                   font=("Arial", 10, "bold"), fg="#81b64c", bg="#262421", wraplength=190, justify="center")
+        self.status_box.pack(pady=15)
+
+        self.heard_label = tk.Label(self.panel, text='Heard: ""', font=("Arial", 10, "italic"), fg="#64c8ff", bg="#262421", wraplength=190)
+        self.heard_label.pack(pady=5)
+
+        guide_text = (
+            "💡 Speak Clearly:\n"
+            "• 'E4' / 'E2 to E4'\n"
+            "• 'Soldier E4'\n"
+            "• 'Knight F3' / 'Night to F3'\n"
+            "• 'Castle'\n\n"
+            "⚙️ Commands:\n"
+            "• 'reset game'\n"
+            "• 'exit game'"
+        )
+        tk.Label(self.panel, text=guide_text, font=("Arial", 9), fg="#aaa", bg="#262421", justify="left").pack(pady=15, padx=10)
+
+    def draw_board_coordinates(self):
+        files = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']
+        ranks = ['8', '7', '6', '5', '4', '3', '2', '1']
+
+        for c in range(8):
+            x = self.offset_x + c * self.square_size + self.square_size / 2
+            self.canvas.create_text(x, 15, text=files[c], fill="#aaaaaa", font=("Arial", 11, "bold"))
+            self.canvas.create_text(x, self.offset_y + 8 * self.square_size + 15, text=files[c], fill="#aaaaaa", font=("Arial", 11, "bold"))
+
+        for r in range(8):
+            y = self.offset_y + r * self.square_size + self.square_size / 2
+            self.canvas.create_text(15, y, text=ranks[r], fill="#aaaaaa", font=("Arial", 11, "bold"))
+            self.canvas.create_text(self.offset_x + 8 * self.square_size + 15, y, text=ranks[r], fill="#aaaaaa", font=("Arial", 11, "bold"))
+
+    def update_board_display(self):
+        self.canvas.delete("all")
+        self.draw_board_coordinates()
+
+        colors = ["#eeeed2", "#769656"]
+        last_move = self.board.peek() if len(self.board.move_stack) > 0 else None
+
+        for r in range(8):
+            for c in range(8):
+                square = chess.square(c, 7 - r)
+                color = colors[(r + c) % 2]
+
+                if last_move and (square == last_move.from_square or square == last_move.to_square):
+                    color = "#baca44"
+
+                x1 = self.offset_x + c * self.square_size
+                y1 = self.offset_y + r * self.square_size
+                x2 = x1 + self.square_size
+                y2 = y1 + self.square_size
+
+                self.canvas.create_rectangle(x1, y1, x2, y2, fill=color, outline="")
+
+                piece = self.board.piece_at(square)
+                if piece and piece.symbol() in self.piece_images:
+                    self.canvas.create_image(x1 + 30, y1 + 30, image=self.piece_images[piece.symbol()])
+
+        current_turn = "White" if self.board.turn == chess.WHITE else "Black"
+        self.turn_label.config(text=f"Turn: {current_turn}")
+
+    def parse_spoken_move(self, text):
+        text = text.lower().strip()
+
+        if any(c in text for c in ["exit game", "quit game", "stop game", "close game"]):
+            self.on_closing()
+            return "EXIT"
+
+        if "reset game" in text or "restart game" in text:
+            self.board.reset()
+            self.update_board_display()
+            self.status_box.config(text="Game Reset!\nSpeak your move.", fg="#81b64c")
+            return "RESET"
+
+        pawn_aliases = [
+            "soldier", "man", "foot", "march", "push", "porn", "palm", "pong", 
+            "spawn", "upon", "park", "part", "pan", "bond", "pawn"
+        ]
+        for word in pawn_aliases:
+            text = text.replace(word, "")
+
+        phonetics = {
+            "see": "c", "sea": "c", "be": "b", "bee": "b", "day": "d",
+            "eff": "f", "gee": "g", "ache": "h", "ate": "8", "to": "", "too": "", "two": "2",
+            "for": "4", "four": "4", "one": "1", "three": "3", "five": "5", "six": "6", "seven": "7"
+        }
+        for k, v in phonetics.items():
+            text = text.replace(f" {k} ", f" {v} ")
+
+        if any(p in text for p in ["castle queenside", "castle queen side", "castle long"]):
+            return "O-O-O"
+        if any(p in text for p in ["castle kingside", "castle king side", "castle short", "castle"]):
+            return "O-O"
+
+        replacements = {
+            "knight": "N", "night": "N", "horse": "N",
+            "bishop": "B", "rook": "R", "castle": "R",
+            "queen": "Q", "king": "K"
+        }
+        for k, v in replacements.items():
+            text = text.replace(k, v)
+
+        return text.replace(" ", "")
+
+    def execute_move(self, raw_input):
+        parsed = self.parse_spoken_move(raw_input)
+        if parsed in ["EXIT", "RESET"]:
+            return
+
+        move_executed = False
+
+        try:
+            move = self.board.parse_san(parsed)
+            self.board.push(move)
+            move_executed = True
+        except ValueError:
+            pass
+
+        if not move_executed:
+            try:
+                move = chess.Move.from_uci(parsed)
+                if move in self.board.legal_moves:
+                    self.board.push(move)
+                    move_executed = True
+            except ValueError:
+                pass
+
+        if move_executed:
+            self.status_box.config(text=f"Played: {self.board.peek()}", fg="#00ff99")
+            self.update_board_display()
+            if self.board.is_game_over():
+                messagebox.showinfo("Game Over", f"Result: {self.board.result()}")
+        else:
+            self.status_box.config(text=f"Couldn't match '{raw_input}'\nTry saying: 'E4' or 'E2 E4'", fg="#ffaa00")
+
+    def continuous_sounddevice_loop(self):
+        """ Listens using sounddevice instead of PyAudio """
+        record_seconds = 3.5
+
+        while self.is_running:
+            try:
+                self.status_box.config(text="🟢 Listening...\nSpeak move anytime!", fg="#81b64c")
+                
+                # Record directly with sounddevice
+                audio_data = sd.rec(int(record_seconds * self.sample_rate), 
+                                    samplerate=self.sample_rate, channels=1, dtype='int16')
+                sd.wait()
+
+                if not self.is_running:
+                    break
+
+                # Ignore pure silence / background hum
+                audio_np = audio_data.flatten()
+                if np.max(np.abs(audio_np)) < 500:  # Noise gate threshold
+                    continue
+
+                self.status_box.config(text="⚡ Processing speech...", fg="#64c8ff")
+
+                # Convert raw sounddevice audio to SpeechRecognition format
+                byte_data = audio_data.tobytes()
+                audio_obj = sr.AudioData(byte_data, self.sample_rate, 2)
+
+                try:
+                    spoken = self.recognizer.recognize_google(audio_obj)
+                    self.heard_label.config(text=f'Heard: "{spoken}"')
+                    self.execute_move(spoken)
+                except sr.UnknownValueError:
+                    pass
+                except sr.RequestError:
+                    self.status_box.config(text="⚠️ Network Error", fg="#ff6666")
+
+            except Exception as e:
+                time.sleep(0.5)
+
+    def on_closing(self):
+        self.is_running = False
+        self.root.destroy()
+        sys.exit(0)
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = HandsFreeVoiceChess(root)
+    root.mainloop()
